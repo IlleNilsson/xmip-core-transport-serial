@@ -295,22 +295,16 @@ impl Loopback for SerialTransport {
     /// In order on one thread: a line does not listen, so the write goes
     /// first and the read finds it, both ends framed for this payload.
     fn round(&self, payload: &[u8]) -> Result<Arrived> {
-        let line = self.clone().framed(self.framing_for(payload));
-        let far = line.far_end()?;
-        line.send_to(far.address(), payload)?;
-        let arrived = far.take_one()?;
-        if arrived.bytes != payload {
-            return Err(protocol_error(
-                "written, but what came off the line differs",
-            ));
-        }
-        Ok(arrived)
+        self.clone()
+            .framed(self.framing_for(payload))
+            .round_in_order(payload)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::payload::edge_payloads;
 
     #[test]
     fn delimited_frames_end_at_the_delimiter_and_keep_partial_matches() {
@@ -342,18 +336,6 @@ mod tests {
         assert!(line.claims().is_none());
         assert_eq!(line.name(), "serial");
         assert!(line.far_end().is_err(), "a device is not a loopback line");
-    }
-
-    /// The shapes a protocol breaks on, as the Playground lists them.
-    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
-        vec![
-            ("empty", Vec::new()),
-            ("one byte", vec![0x2a]),
-            ("every byte", (0..=255).collect()),
-            ("nul run", vec![0; 512]),
-            ("high bytes", vec![0xff; 512]),
-            ("crlf storm", b"\r\n".repeat(400)),
-        ]
     }
 
     #[test]
