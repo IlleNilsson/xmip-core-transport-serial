@@ -21,7 +21,9 @@ use std::io::BufRead;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use transport::arrived::next_arrival;
 use transport::error::{Result, classify, protocol_error};
+use transport::held::Held;
 use transport::line::Line;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::{Arrived, Directions, Transport};
@@ -331,28 +333,20 @@ fn lock_line(line: &Wire) -> std::sync::MutexGuard<'_, Vec<u8>> {
     line.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The line one frame was written to. Nothing waits: the round is in order.
-struct Written(SerialTransport);
-
-impl FarEnd for Written {
-    fn address(&self) -> &str {
-        &self.0.port
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        Transport::receive(&self.0)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| protocol_error("written, but nothing came off the line"))
-    }
-}
-
 impl Loopback for SerialTransport {
+    /// The line one frame was written to. Nothing waits: the round is in
+    /// order.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         if self.line.is_none() {
             return Err(protocol_error("a device, not a loopback line"));
         }
-        Ok(Box::new(Written(self.clone())))
+        let line = self.clone();
+        Ok(Box::new(Held::new(self.port.clone(), move || {
+            next_arrival(
+                Transport::receive(&line)?,
+                "written, but nothing came off the line",
+            )
+        })))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
