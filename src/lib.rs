@@ -11,23 +11,40 @@
 //! both ends of a loopback share.
 //!
 //! The origin URI is the port: `serial:///dev/ttyUSB0?baud=9600`.
+//!
+//! Two lines, one boundary. A protocol on a serial line — M-Bus, HART —
+//! writes frames to a [`Line`] and reads them from it; a port is one, and
+//! [`bus::Bus`] is the other: a multi-drop bus in process, with addressed
+//! devices on it, for every test and every box without a port.
+
+pub mod bus;
 
 use std::io::BufRead;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use transport::error::{Result, classify, protocol_error};
+use transport::line::Line;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::{Arrived, Directions, Transport};
 
-/// Where one frame ends.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Where one frame ends. Not comparable: a measured frame's rule is a
+/// function, and two function pointers are not reliably equal.
+#[derive(Clone, Debug)]
 pub enum Framing {
     /// The frame ends with these bytes, which are not part of it.
     Delimited(Vec<u8>),
     /// Every frame is exactly this long.
     Fixed(usize),
+    /// The frame says its own length in its first bytes, as M-Bus and HART
+    /// frames do: given the bytes read so far, the protocol answers the
+    /// frame's whole length, or `None` while it needs another byte to tell.
+    Measured(Measure),
 }
+
+/// How long a frame is, from the bytes read of it so far; see
+/// [`Framing::Measured`].
+pub type Measure = fn(&[u8]) -> Result<Option<usize>>;
 
 /// Read one frame from `reader` under `framing`.
 ///
@@ -41,6 +58,27 @@ pub fn read_frame(reader: &mut impl BufRead, framing: &Framing) -> Result<Vec<u8
                 .read_exact(&mut frame)
                 .map_err(|e| classify("reading a fixed frame", &e))?;
             Ok(frame)
+        }
+        Framing::Measured(measure) => {
+            let mut frame = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                reader
+                    .read_exact(&mut byte)
+                    .map_err(|e| classify("reading a measured frame", &e))?;
+                frame.push(byte[0]);
+                if let Some(length) = measure(&frame)? {
+                    if length > MAX_FRAME {
+                        return Err(protocol_error("a frame over the size Xmip will read"));
+                    }
+                    let mut rest = vec![0u8; length.saturating_sub(frame.len())];
+                    reader
+                        .read_exact(&mut rest)
+                        .map_err(|e| classify("reading a measured frame", &e))?;
+                    frame.extend(rest);
+                    return Ok(frame);
+                }
+            }
         }
         Framing::Delimited(delimiter) => {
             let last = *delimiter
@@ -71,8 +109,8 @@ pub fn read_frame(reader: &mut impl BufRead, framing: &Framing) -> Result<Vec<u8
 /// The most a delimited frame may be before the line is judged broken.
 pub const MAX_FRAME: usize = 1024 * 1024;
 
-/// An in-memory line: what one end writes, the other reads, in order.
-type Line = Arc<Mutex<Vec<u8>>>;
+/// An in-memory wire: what one end writes, the other reads, in order.
+type Wire = Arc<Mutex<Vec<u8>>>;
 
 #[derive(Clone)]
 pub struct SerialTransport {
@@ -81,7 +119,7 @@ pub struct SerialTransport {
     framing: Framing,
     timeout: Duration,
     /// Set on a loopback: the line stands in for the device.
-    line: Option<Line>,
+    line: Option<Wire>,
 }
 
 impl SerialTransport {
@@ -136,6 +174,7 @@ impl SerialTransport {
                 Ok(out)
             }
             Framing::Fixed(length) if bytes.len() == *length => Ok(bytes.to_vec()),
+            Framing::Measured(_) => Ok(bytes.to_vec()),
             Framing::Fixed(length) => Err(protocol_error(format!(
                 "a frame of {} bytes on a line framed at {length}",
                 bytes.len()
@@ -144,7 +183,7 @@ impl SerialTransport {
     }
 
     /// One frame off the in-memory line, the rest left for the next.
-    fn read_line(&self, line: &Line) -> Result<Arrived> {
+    fn read_line(&self, line: &Wire) -> Result<Arrived> {
         let mut wire = line.lock().unwrap_or_else(PoisonError::into_inner);
         let mut reader: &[u8] = &wire;
         let arrived = self.read_one(&mut reader)?;
@@ -154,7 +193,7 @@ impl SerialTransport {
     }
 
     /// `bytes` framed onto the in-memory line.
-    fn write_line(&self, line: &Line, bytes: &[u8]) -> Result<()> {
+    fn write_line(&self, line: &Wire, bytes: &[u8]) -> Result<()> {
         let framed = self.framed_bytes(bytes)?;
         line.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -241,7 +280,7 @@ impl SerialTransport {
         let mut line = Self::new("loopback", 9600)
             .framed(Framing::Delimited(vec![0x04]))
             .timing_out_after(LOOPBACK_TIMEOUT);
-        line.line = Some(Line::default());
+        line.line = Some(Wire::default());
         line
     }
 
@@ -261,6 +300,39 @@ impl SerialTransport {
     }
 }
 
+/// A serial port is a line: a frame goes out as the protocol wrote it, and
+/// comes back framed as this port frames — [`Framing::Measured`] for a
+/// protocol that says its own length.
+impl Line for SerialTransport {
+    fn name(&self) -> String {
+        self.port.clone()
+    }
+
+    fn transmit(&self, frame: &[u8]) -> Result<()> {
+        self.send("", frame)
+    }
+
+    fn receive(&self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
+        match Transport::receive(self) {
+            Ok(arrived) => Ok(arrived.into_iter().next().map(|one| one.bytes)),
+            // An in-memory line with nothing on it is silence, not a fault.
+            Err(_)
+                if self
+                    .line
+                    .as_ref()
+                    .is_some_and(|line| lock_line(line).is_empty()) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn lock_line(line: &Wire) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    line.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The line one frame was written to. Nothing waits: the round is in order.
 struct Written(SerialTransport);
 
@@ -270,8 +342,7 @@ impl FarEnd for Written {
     }
 
     fn take_one(self: Box<Self>) -> Result<Arrived> {
-        self.0
-            .receive()?
+        Transport::receive(&self.0)?
             .into_iter()
             .next()
             .ok_or_else(|| protocol_error("written, but nothing came off the line"))
@@ -334,7 +405,7 @@ mod tests {
     fn a_line_has_no_artefact_to_claim() {
         let line = SerialTransport::new("COM1", 9600).timing_out_after(Duration::from_millis(10));
         assert!(line.claims().is_none());
-        assert_eq!(line.name(), "serial");
+        assert_eq!(Transport::name(&line), "serial");
         assert!(line.far_end().is_err(), "a device is not a loopback line");
     }
 
@@ -348,7 +419,10 @@ mod tests {
         // framed by length instead.
         let arrived = loopback.round(b"eot\x04inside").expect("fixed");
         assert_eq!(arrived.bytes, b"eot\x04inside");
-        assert_eq!(loopback.framing_for(b"eot\x04inside"), Framing::Fixed(10));
+        assert!(matches!(
+            loopback.framing_for(b"eot\x04inside"),
+            Framing::Fixed(10)
+        ));
         assert!(loopback.ceiling().is_none());
         assert!(loopback.refuses(b"eot\x04inside").is_none());
     }
@@ -358,9 +432,45 @@ mod tests {
         let loopback = SerialTransport::loopback();
         loopback.send("loopback", b"first").expect("writing");
         loopback.send("loopback", b"second").expect("writing");
-        assert_eq!(loopback.receive().expect("reading")[0].bytes, b"first");
-        assert_eq!(loopback.receive().expect("reading")[0].bytes, b"second");
-        assert!(loopback.receive().is_err(), "the line is empty");
+        assert_eq!(
+            Transport::receive(&loopback).expect("reading")[0].bytes,
+            b"first"
+        );
+        assert_eq!(
+            Transport::receive(&loopback).expect("reading")[0].bytes,
+            b"second"
+        );
+        assert!(Transport::receive(&loopback).is_err(), "the line is empty");
+    }
+
+    #[test]
+    fn a_measured_frame_is_read_to_the_length_its_header_says() {
+        // A frame that opens with its length: 0x02 then two bytes. A length
+        // of zero opens no frame, and the protocol says so.
+        fn measure(read: &[u8]) -> Result<Option<usize>> {
+            match read.first() {
+                Some(0) => Err(protocol_error("a frame of no length")),
+                length => Ok(length.map(|length| usize::from(*length) + 1)),
+            }
+        }
+        let port = SerialTransport::new("COM4", 2400).framed(Framing::Measured(measure));
+        let mut reader = std::io::BufReader::new(&b"\x02ab\x01c\x00"[..]);
+        assert_eq!(port.read_one(&mut reader).expect("frame").bytes, b"\x02ab");
+        assert_eq!(port.read_one(&mut reader).expect("frame").bytes, b"\x01c");
+        assert!(port.read_one(&mut reader).is_err(), "no length");
+        assert!(port.read_one(&mut reader).is_err(), "the line closed");
+    }
+
+    #[test]
+    fn a_loopback_wire_is_a_line_and_its_silence_is_none() {
+        let wire = SerialTransport::loopback();
+        assert_eq!(Line::name(&wire), "loopback");
+        Line::transmit(&wire, b"frame").expect("sent");
+        assert_eq!(
+            Line::receive(&wire, Duration::ZERO).expect("read"),
+            Some(b"frame".to_vec())
+        );
+        assert_eq!(Line::receive(&wire, Duration::ZERO).expect("silence"), None);
     }
 
     #[test]
