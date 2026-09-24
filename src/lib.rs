@@ -12,12 +12,10 @@
 //!
 //! The origin URI is the port: `serial:///dev/ttyUSB0?baud=9600`.
 //!
-//! Two lines, one boundary. A protocol on a serial line — M-Bus, HART —
-//! writes frames to a [`Line`] and reads them from it; a port is one, and
-//! [`bus::Bus`] is the other: a multi-drop bus in process, with addressed
-//! devices on it, for every test and every box without a port.
-
-pub mod bus;
+//! A protocol on a serial line — M-Bus, HART — writes frames to a [`Line`]
+//! and reads them from it, and a port is one. The multi-drop bus a protocol is
+//! tested on, with addressed devices on it, is the SDK's simulator,
+//! `sdk::serial::Bus`: the same boundary, in process.
 
 use std::io::BufRead;
 use std::sync::{Arc, Mutex, PoisonError};

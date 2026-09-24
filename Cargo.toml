@@ -20,7 +20,11 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 
 # The port itself, cross-platform. Behind the `port` feature, on by default,
 # so a build for a box with no serial stack can leave it out and keep the framing.
-serialport = { version = "4", optional = true }
+# Without its default features: they are libudev, for listing USB ports, which
+# nothing here does, and on Linux they made the crate need the libudev
+# development headers to build at all — found on the AlmaLinux guest on
+# 2026-09-24, where serial had never been built before.
+serialport = { version = "4", optional = true, default-features = false }
 
 [features]
 default = ["port"]
