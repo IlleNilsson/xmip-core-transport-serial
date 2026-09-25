@@ -353,7 +353,11 @@ impl Loopback for SerialTransport {
         self.send(address, payload)
     }
 
-    fn unblock(&self, _address: &str) {}
+    /// A line does not listen: its two ends exchange in order, and there is
+    /// nothing for a failed write to release.
+    fn exchanges_in_order(&self) -> bool {
+        true
+    }
 
     /// In order on one thread: a line does not listen, so the write goes
     /// first and the read finds it, both ends framed for this payload.
