@@ -28,6 +28,8 @@ use transport::line::Line;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::{Arrived, Directions, Transport};
 
+mod settings;
+
 /// Where one frame ends. Not comparable: a measured frame's rule is a
 /// function, and two function pointers are not reliably equal.
 #[derive(Clone, Debug)]
@@ -109,6 +111,9 @@ pub fn read_frame(reader: &mut impl BufRead, framing: &Framing) -> Result<Vec<u8
 /// The most a delimited frame may be before the line is judged broken.
 pub const MAX_FRAME: usize = 1024 * 1024;
 
+/// How long a read waits on the port until a Location says otherwise.
+pub const TIMEOUT: Duration = Duration::from_secs(5);
+
 /// An in-memory wire: what one end writes, the other reads, in order.
 type Wire = Arc<Mutex<Vec<u8>>>;
 
@@ -130,7 +135,7 @@ impl SerialTransport {
             port: port.into(),
             baud,
             framing: Framing::Delimited(b"\r\n".to_vec()),
-            timeout: Duration::from_secs(5),
+            timeout: TIMEOUT,
             line: None,
         }
     }
