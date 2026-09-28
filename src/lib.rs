@@ -157,6 +157,13 @@ impl SerialTransport {
         format!("serial://{}?baud={}", self.port, self.baud)
     }
 
+    /// The port the line is open on — `COM3`, `/dev/ttyUSB0`, `loopback` —
+    /// which a protocol riding on the line names in its own origin.
+    #[must_use]
+    pub fn port(&self) -> &str {
+        &self.port
+    }
+
     /// One frame from any byte source, framed as this port frames.
     ///
     /// # Errors
@@ -171,7 +178,7 @@ impl SerialTransport {
     ///
     /// # Errors
     /// A fixed-length frame of the wrong length.
-    pub fn framed_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+    fn framed_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         match &self.framing {
             Framing::Delimited(delimiter) => {
                 let mut out = bytes.to_vec();
@@ -390,6 +397,7 @@ mod tests {
         assert!(line.read_one(&mut reader).is_err(), "the line closed");
         assert_eq!(line.framed_bytes(b"go").expect("framed"), b"go\r\n");
         assert_eq!(line.origin(), "serial://COM3?baud=9600");
+        assert_eq!(line.port(), "COM3");
     }
 
     #[test]
