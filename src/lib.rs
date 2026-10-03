@@ -3,7 +3,8 @@
 //! Streams that arrive on a serial port. One frame is one Stream.
 //!
 //! A serial line has no message boundary of its own, so the boundary is
-//! configured: a delimiter the frame ends with, or a fixed length. Everything
+//! configured (`framing.rs`): a delimiter the frame ends with, or a fixed
+//! length, or the length the frame says of itself. Everything
 //! between boundaries is the Stream; the port's bytes are never interpreted
 //! here. The port itself — a COM port, `/dev/ttyUSB0`, an RS-485 adapter — is
 //! opened through the `port` feature; the framing is what the tests hold and
@@ -16,100 +17,31 @@
 //! and reads them from it, and a port is one. The multi-drop bus a protocol is
 //! tested on, with addressed devices on it, is the SDK's simulator,
 //! `sdk::serial::Bus`: the same boundary, in process.
+//!
+//! **Acceptance is at-most-once here** ([`AT_MOST_ONCE`]): a frame read off
+//! the line is gone, and a raw line has no reply to defer.
 
 use std::io::BufRead;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use transport::arrived::next_arrival;
-use transport::error::{Result, classify, protocol_error};
+#[cfg(feature = "port")]
+use transport::error::classify;
+use transport::error::{Result, protocol_error};
 use transport::held::Held;
 use transport::line::Line;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::{Arrived, Directions, Transport};
+use transport::{Acknowledgement, Arrived, Directions, Taken, Transport};
 
+mod framing;
 mod settings;
 
-/// Where one frame ends. Not comparable: a measured frame's rule is a
-/// function, and two function pointers are not reliably equal.
-#[derive(Clone, Debug)]
-pub enum Framing {
-    /// The frame ends with these bytes, which are not part of it.
-    Delimited(Vec<u8>),
-    /// Every frame is exactly this long.
-    Fixed(usize),
-    /// The frame says its own length in its first bytes, as M-Bus and HART
-    /// frames do: given the bytes read so far, the protocol answers the
-    /// frame's whole length, or `None` while it needs another byte to tell.
-    Measured(Measure),
-}
+pub use framing::{Framing, MAX_FRAME, Measure, read_frame};
 
-/// How long a frame is, from the bytes read of it so far; see
-/// [`Framing::Measured`].
-pub type Measure = fn(&[u8]) -> Result<Option<usize>>;
-
-/// Read one frame from `reader` under `framing`.
-///
-/// # Errors
-/// The line closed inside a frame, or a delimited frame outgrew [`MAX_FRAME`].
-pub fn read_frame(reader: &mut impl BufRead, framing: &Framing) -> Result<Vec<u8>> {
-    match framing {
-        Framing::Fixed(length) => {
-            let mut frame = vec![0u8; *length];
-            reader
-                .read_exact(&mut frame)
-                .map_err(|e| classify("reading a fixed frame", &e))?;
-            Ok(frame)
-        }
-        Framing::Measured(measure) => {
-            let mut frame = Vec::new();
-            loop {
-                let mut byte = [0u8; 1];
-                reader
-                    .read_exact(&mut byte)
-                    .map_err(|e| classify("reading a measured frame", &e))?;
-                frame.push(byte[0]);
-                if let Some(length) = measure(&frame)? {
-                    if length > MAX_FRAME {
-                        return Err(protocol_error("a frame over the size Xmip will read"));
-                    }
-                    let mut rest = vec![0u8; length.saturating_sub(frame.len())];
-                    reader
-                        .read_exact(&mut rest)
-                        .map_err(|e| classify("reading a measured frame", &e))?;
-                    frame.extend(rest);
-                    return Ok(frame);
-                }
-            }
-        }
-        Framing::Delimited(delimiter) => {
-            let last = *delimiter
-                .last()
-                .ok_or_else(|| protocol_error("an empty delimiter"))?;
-            let mut frame = Vec::new();
-            loop {
-                let mut chunk = Vec::new();
-                let read = reader
-                    .read_until(last, &mut chunk)
-                    .map_err(|e| classify("reading a delimited frame", &e))?;
-                if read == 0 {
-                    return Err(protocol_error("the line closed inside a frame"));
-                }
-                frame.extend_from_slice(&chunk);
-                if frame.ends_with(delimiter) {
-                    frame.truncate(frame.len() - delimiter.len());
-                    return Ok(frame);
-                }
-                if frame.len() > MAX_FRAME {
-                    return Err(protocol_error("a frame over the size Xmip will read"));
-                }
-            }
-        }
-    }
-}
-
-/// The most a delimited frame may be before the line is judged broken.
-pub const MAX_FRAME: usize = 1024 * 1024;
+/// Why a frame read off a serial line is not acknowledged after the cycle.
+pub const AT_MOST_ONCE: &str = "a serial line has no reply: a frame read off it is gone from \
+                                the device's buffer, and the device does not send it again";
 
 /// How long a read waits on the port until a Location says otherwise.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
@@ -164,13 +96,18 @@ impl SerialTransport {
         &self.port
     }
 
-    /// One frame from any byte source, framed as this port frames.
+    /// One frame from any byte source, framed as this port frames: whole,
+    /// and at-most-once ([`AT_MOST_ONCE`]).
     ///
     /// # Errors
     /// As [`read_frame`].
     pub fn read_one(&self, reader: &mut impl BufRead) -> Result<Arrived> {
         let frame = read_frame(reader, &self.framing)?;
-        Ok(Arrived::new(self.origin(), frame))
+        Ok(Arrived::whole(
+            self.origin(),
+            frame,
+            Acknowledgement::at_most_once(AT_MOST_ONCE),
+        ))
     }
 
     /// `bytes` as one frame on the line: the delimiter appended, or the fixed
@@ -268,6 +205,12 @@ impl Transport for SerialTransport {
         Directions::BOTH
     }
 
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("one line or bus, answered in the order it speaks")
+    }
+
+    /// One frame off the port or the loopback line. Acceptance is
+    /// at-most-once here: a raw line has no reply to defer ([`AT_MOST_ONCE`]).
     fn receive(&self) -> Result<Vec<Arrived>> {
         let arrived = match &self.line {
             Some(line) => self.read_line(line)?,
@@ -326,7 +269,10 @@ impl Line for SerialTransport {
 
     fn receive(&self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
         match Transport::receive(self) {
-            Ok(arrived) => Ok(arrived.into_iter().next().map(|one| one.bytes)),
+            Ok(arrived) => match arrived.into_iter().next() {
+                Some(one) => Ok(Some(one.taken()?.bytes)),
+                None => Ok(None),
+            },
             // An in-memory line with nothing on it is silence, not a fault.
             Err(_)
                 if self
@@ -357,7 +303,8 @@ impl Loopback for SerialTransport {
             next_arrival(
                 Transport::receive(&line)?,
                 "written, but nothing came off the line",
-            )
+            )?
+            .taken()
         })))
     }
 
@@ -373,7 +320,7 @@ impl Loopback for SerialTransport {
 
     /// In order on one thread: a line does not listen, so the write goes
     /// first and the read finds it, both ends framed for this payload.
-    fn round(&self, payload: &[u8]) -> Result<Arrived> {
+    fn round(&self, payload: &[u8]) -> Result<Taken> {
         self.clone()
             .framed(self.framing_for(payload))
             .round_in_order(payload)
@@ -385,15 +332,19 @@ mod tests {
     use super::*;
     use transport::payload::edge_payloads;
 
+    /// The bytes of the one frame `read` read, taken.
+    fn frame(read: Result<Arrived>) -> Vec<u8> {
+        read.expect("frame").taken().expect("taken").bytes
+    }
+
     #[test]
     fn delimited_frames_end_at_the_delimiter_and_keep_partial_matches() {
         let line = SerialTransport::new("COM3", 9600);
         let mut reader = std::io::BufReader::new(&b"first\r\nsec\rond\r\n"[..]);
-        assert_eq!(line.read_one(&mut reader).expect("frame").bytes, b"first");
-        assert_eq!(
-            line.read_one(&mut reader).expect("frame").bytes,
-            b"sec\rond"
-        );
+        let first = line.read_one(&mut reader).expect("frame");
+        assert!(!first.defers(), "a serial line is at-most-once");
+        assert_eq!(first.taken().expect("taken").bytes, b"first");
+        assert_eq!(frame(line.read_one(&mut reader)), b"sec\rond");
         assert!(line.read_one(&mut reader).is_err(), "the line closed");
         assert_eq!(line.framed_bytes(b"go").expect("framed"), b"go\r\n");
         assert_eq!(line.origin(), "serial://COM3?baud=9600");
@@ -404,8 +355,8 @@ mod tests {
     fn fixed_frames_are_exactly_their_length() {
         let line = SerialTransport::new("/dev/ttyUSB0", 115_200).framed(Framing::Fixed(4));
         let mut reader = std::io::BufReader::new(&b"abcdefgh"[..]);
-        assert_eq!(line.read_one(&mut reader).expect("frame").bytes, b"abcd");
-        assert_eq!(line.read_one(&mut reader).expect("frame").bytes, b"efgh");
+        assert_eq!(frame(line.read_one(&mut reader)), b"abcd");
+        assert_eq!(frame(line.read_one(&mut reader)), b"efgh");
         assert!(line.framed_bytes(b"abc").is_err());
         assert_eq!(line.framed_bytes(b"abcd").expect("framed"), b"abcd");
     }
@@ -441,14 +392,10 @@ mod tests {
         let loopback = SerialTransport::loopback();
         loopback.send("loopback", b"first").expect("writing");
         loopback.send("loopback", b"second").expect("writing");
-        assert_eq!(
-            Transport::receive(&loopback).expect("reading")[0].bytes,
-            b"first"
-        );
-        assert_eq!(
-            Transport::receive(&loopback).expect("reading")[0].bytes,
-            b"second"
-        );
+        for sent in [&b"first"[..], b"second"] {
+            let read = Transport::receive(&loopback).expect("reading");
+            assert_eq!(frame(next_arrival(read, "a frame")), sent);
+        }
         assert!(Transport::receive(&loopback).is_err(), "the line is empty");
     }
 
@@ -464,8 +411,8 @@ mod tests {
         }
         let port = SerialTransport::new("COM4", 2400).framed(Framing::Measured(measure));
         let mut reader = std::io::BufReader::new(&b"\x02ab\x01c\x00"[..]);
-        assert_eq!(port.read_one(&mut reader).expect("frame").bytes, b"\x02ab");
-        assert_eq!(port.read_one(&mut reader).expect("frame").bytes, b"\x01c");
+        assert_eq!(frame(port.read_one(&mut reader)), b"\x02ab");
+        assert_eq!(frame(port.read_one(&mut reader)), b"\x01c");
         assert!(port.read_one(&mut reader).is_err(), "no length");
         assert!(port.read_one(&mut reader).is_err(), "the line closed");
     }
