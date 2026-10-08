@@ -25,6 +25,7 @@ use std::io::BufRead;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use transport::ArrivalIdentity;
 use transport::arrived::next_arrival;
 #[cfg(feature = "port")]
 use transport::error::classify;
@@ -292,6 +293,10 @@ fn lock_line(line: &Wire) -> std::sync::MutexGuard<'_, Vec<u8>> {
 }
 
 impl Loopback for SerialTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed("a serial line has one far end, and names it nowhere")
+    }
+
     /// The line one frame was written to. Nothing waits: the round is in
     /// order.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
