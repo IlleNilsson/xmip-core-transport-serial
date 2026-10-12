@@ -210,6 +210,10 @@ impl Transport for SerialTransport {
         transport::Arrivals::Ordered("one line or bus, answered in the order it speaks")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Waits("a read of the line waits for a frame or its timeout")
+    }
+
     /// One frame off the port or the loopback line. Acceptance is
     /// at-most-once here: a raw line has no reply to defer ([`AT_MOST_ONCE`]).
     fn receive(&self) -> Result<Vec<Arrived>> {
