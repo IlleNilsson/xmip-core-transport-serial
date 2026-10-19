@@ -216,7 +216,7 @@ impl Transport for SerialTransport {
 
     /// One frame off the port or the loopback line. Acceptance is
     /// at-most-once here: a raw line has no reply to defer ([`AT_MOST_ONCE`]).
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
         let arrived = match &self.line {
             Some(line) => self.read_line(line)?,
             None => self.receive_port()?,
@@ -224,7 +224,14 @@ impl Transport for SerialTransport {
         Ok(vec![arrived])
     }
 
-    fn send(&self, _target: &str, bytes: &[u8]) -> Result<()> {
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered(
+            "a frame's delimiter or length is chosen by whether the body holds the delimiter",
+        )
+    }
+
+    fn send_from(&self, _target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
         match &self.line {
             Some(line) => self.write_line(line, bytes),
             None => self.send_port(bytes),
