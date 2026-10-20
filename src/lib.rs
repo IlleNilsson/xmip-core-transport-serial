@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_has_no_artefact_to_claim() {
+    fn a_line_has_no_artifact_to_claim() {
         let line = SerialTransport::new("COM1", 9600).timing_out_after(Duration::from_millis(10));
         assert!(line.claims().is_none());
         assert_eq!(Transport::name(&line), "serial");
