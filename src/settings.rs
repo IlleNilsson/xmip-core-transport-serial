@@ -54,6 +54,9 @@ impl Configured for SerialTransport {
         ],
     };
 
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["serial"];
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let baud = u32::try_from(settings.integer("baud"))
             .map_err(|_| protocol_error("the baud rate is out of range"))?;
