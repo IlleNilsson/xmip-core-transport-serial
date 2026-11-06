@@ -22,8 +22,9 @@
 //! the line is gone, and a raw line has no reply to defer.
 
 use std::io::BufRead;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use xcore::lock::Locked;
 
 use transport::ArrivalIdentity;
 use transport::arrived::next_arrival;
@@ -134,7 +135,7 @@ impl SerialTransport {
 
     /// One frame off the in-memory line, the rest left for the next.
     fn read_line(&self, line: &Wire) -> Result<Arrived> {
-        let mut wire = line.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut wire = line.locked();
         let mut reader: &[u8] = &wire;
         let arrived = self.read_one(&mut reader)?;
         let consumed = wire.len() - reader.len();
@@ -145,9 +146,7 @@ impl SerialTransport {
     /// `bytes` framed onto the in-memory line.
     fn write_line(&self, line: &Wire, bytes: &[u8]) -> Result<()> {
         let framed = self.framed_bytes(bytes)?;
-        line.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(&framed);
+        line.locked().extend_from_slice(&framed);
         Ok(())
     }
 
@@ -300,7 +299,7 @@ impl Line for SerialTransport {
 }
 
 fn lock_line(line: &Wire) -> std::sync::MutexGuard<'_, Vec<u8>> {
-    line.lock().unwrap_or_else(PoisonError::into_inner)
+    line.locked()
 }
 
 impl Loopback for SerialTransport {
