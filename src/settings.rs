@@ -84,6 +84,7 @@ impl Configured for SerialTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use transport::Transport;
     use xcore::settings::Given;
 
@@ -97,7 +98,7 @@ mod tests {
         let built = <SerialTransport as Configured>::open("COM3", Applies::Receive, &given)
             .expect("configured");
         assert_eq!(built.origin(), "serial://COM3?baud=19200");
-        assert!(matches!(built.framing, Framing::Fixed(12)));
+        assert_matches!(built.framing, Framing::Fixed(12));
         assert_eq!(built.timeout, TIMEOUT);
         assert_eq!(built.name(), "serial");
         let Err(refused) = <SerialTransport as Configured>::open("COM3", Applies::Send, &[]) else {

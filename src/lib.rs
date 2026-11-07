@@ -150,49 +150,52 @@ impl SerialTransport {
         Ok(())
     }
 
-    #[cfg(feature = "port")]
-    fn open(&self) -> Result<Box<dyn serialport::SerialPort>> {
-        serialport::new(&self.port, self.baud)
-            .timeout(self.timeout)
-            .open()
-            .map_err(|e| {
-                transport::error::TransportError::retryable(format!("opening {}: {e}", self.port))
-            })
-    }
+    cfg_select! {
+        feature = "port" => {
+            fn open(&self) -> Result<Box<dyn serialport::SerialPort>> {
+                serialport::new(&self.port, self.baud)
+                    .timeout(self.timeout)
+                    .open()
+                    .map_err(|e| {
+                        transport::error::TransportError::retryable(format!(
+                            "opening {}: {e}",
+                            self.port
+                        ))
+                    })
+            }
 
-    #[cfg(feature = "port")]
-    fn receive_port(&self) -> Result<Arrived> {
-        let port = self.open()?;
-        let mut reader = std::io::BufReader::new(port);
-        self.read_one(&mut reader)
-    }
+            fn receive_port(&self) -> Result<Arrived> {
+                let port = self.open()?;
+                let mut reader = std::io::BufReader::new(port);
+                self.read_one(&mut reader)
+            }
 
-    #[cfg(not(feature = "port"))]
-    fn receive_port(&self) -> Result<Arrived> {
-        Err(self.no_port())
-    }
+            fn send_port(&self, bytes: &[u8]) -> Result<()> {
+                use std::io::Write;
+                let mut port = self.open()?;
+                port.write_all(&self.framed_bytes(bytes)?)
+                    .map_err(|e| classify("writing to the port", &e))?;
+                port.flush().map_err(|e| classify("flushing the port", &e))
+            }
+        }
+        _ => {
+            fn receive_port(&self) -> Result<Arrived> {
+                Err(self.no_port())
+            }
 
-    /// The device cannot be opened on a build without the `port` feature.
-    #[cfg(not(feature = "port"))]
-    fn no_port(&self) -> transport::error::TransportError {
-        protocol_error(format!(
-            "built without the port feature: no serial stack on this box for {}",
-            self.port
-        ))
-    }
+            /// The device cannot be opened on a build without the `port`
+            /// feature.
+            fn no_port(&self) -> transport::error::TransportError {
+                protocol_error(format!(
+                    "built without the port feature: no serial stack on this box for {}",
+                    self.port
+                ))
+            }
 
-    #[cfg(feature = "port")]
-    fn send_port(&self, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
-        let mut port = self.open()?;
-        port.write_all(&self.framed_bytes(bytes)?)
-            .map_err(|e| classify("writing to the port", &e))?;
-        port.flush().map_err(|e| classify("flushing the port", &e))
-    }
-
-    #[cfg(not(feature = "port"))]
-    fn send_port(&self, _bytes: &[u8]) -> Result<()> {
-        Err(self.no_port())
+            fn send_port(&self, _bytes: &[u8]) -> Result<()> {
+                Err(self.no_port())
+            }
+        }
     }
 }
 
@@ -345,6 +348,7 @@ impl Loopback for SerialTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use transport::payload::edge_payloads;
 
     /// The bytes of the one frame `read` read, taken.
@@ -394,10 +398,7 @@ mod tests {
         // framed by length instead.
         let arrived = loopback.round(b"eot\x04inside").expect("fixed");
         assert_eq!(arrived.bytes, b"eot\x04inside");
-        assert!(matches!(
-            loopback.framing_for(b"eot\x04inside"),
-            Framing::Fixed(10)
-        ));
+        assert_matches!(loopback.framing_for(b"eot\x04inside"), Framing::Fixed(10));
         assert!(loopback.ceiling().is_none());
         assert!(loopback.refuses(b"eot\x04inside").is_none());
     }
