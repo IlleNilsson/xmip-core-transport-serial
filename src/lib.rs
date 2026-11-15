@@ -11,6 +11,14 @@
 //! is available on a box with no serial stack at all, over an in-memory line
 //! both ends of a loopback share.
 //!
+//! **The port is opened once and kept open** for as long as the line is
+//! used, by every clone of it: a device's answer to a write lands in the
+//! port's buffer while it is open, and is lost where no handle is. Each read
+//! sets its own wait on the open port, each write the port's own timeout; a
+//! read the wait runs out on with nothing is nothing arrived, never an error.
+//! What the port is opened through is handed in ([`Opens`], ADR-0068): the
+//! operating system's ([`SystemPorts`]) unless another is.
+//!
 //! The origin URI is the port: `serial:///dev/ttyUSB0?baud=9600`.
 //!
 //! A protocol on a serial line — M-Bus, HART — writes frames to a [`Line`]
@@ -21,35 +29,39 @@
 //! **Acceptance is at-most-once here** ([`AT_MOST_ONCE`]): a frame read off
 //! the line is gone, and a raw line has no reply to defer.
 
-use std::io::BufRead;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use xcore::lock::Locked;
 
 use transport::ArrivalIdentity;
 use transport::arrived::next_arrival;
-#[cfg(feature = "port")]
-use transport::error::classify;
-use transport::error::{Result, protocol_error};
+use transport::error::{Result, classify, protocol_error};
 use transport::held::Held;
 use transport::line::Line;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::{Acknowledgement, Arrived, Directions, Taken, Transport};
+use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport};
 
 mod framing;
+mod port;
 mod settings;
 
 pub use framing::{Framing, MAX_FRAME, Measure, read_frame};
+pub use port::{Opens, Port, SystemPorts};
+
+use crate::port::Wire;
 
 /// Why a frame read off a serial line is not acknowledged after the cycle.
 pub const AT_MOST_ONCE: &str = "a serial line has no reply: a frame read off it is gone from \
                                 the device's buffer, and the device does not send it again";
 
-/// How long a read waits on the port until a Location says otherwise.
+/// How long a read or a write waits on the port until a Location says
+/// otherwise; a protocol reading the port as a [`Line`] hands each read its
+/// own wait.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// An in-memory wire: what one end writes, the other reads, in order.
-type Wire = Arc<Mutex<Vec<u8>>>;
+/// An open port, and what was read off it ahead of the frame being read.
+type Open = BufReader<Box<dyn Port>>;
 
 #[derive(Clone)]
 pub struct SerialTransport {
@@ -57,12 +69,17 @@ pub struct SerialTransport {
     baud: u32,
     framing: Framing,
     timeout: Duration,
-    /// Set on a loopback: the line stands in for the device.
-    line: Option<Wire>,
+    /// What the port is opened through: the operating system's, unless
+    /// another is handed in.
+    opens: Arc<dyn Opens>,
+    /// The port once opened, shared by every clone and kept open for as
+    /// long as the line is used.
+    open: Arc<Mutex<Option<Open>>>,
 }
 
 impl SerialTransport {
-    /// `port` at `baud`, frames ending in `\r\n`.
+    /// `port` at `baud`, frames ending in `\r\n`, on the operating system's
+    /// port of that name.
     #[must_use]
     pub fn new(port: impl Into<String>, baud: u32) -> Self {
         Self {
@@ -70,19 +87,23 @@ impl SerialTransport {
             baud,
             framing: Framing::Delimited(b"\r\n".to_vec()),
             timeout: TIMEOUT,
-            line: None,
+            opens: Arc::new(SystemPorts),
+            open: Arc::default(),
         }
+    }
+
+    /// The same line on the port `opens` opens — a provider's, or a test's
+    /// fake (ADR-0068) — in place of the operating system's.
+    #[must_use]
+    pub fn opened_by(mut self, opens: Arc<dyn Opens>) -> Self {
+        self.opens = opens;
+        self.open = Arc::default();
+        self
     }
 
     #[must_use]
     pub fn framed(mut self, framing: Framing) -> Self {
         self.framing = framing;
-        self
-    }
-
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
         self
     }
 
@@ -133,70 +154,57 @@ impl SerialTransport {
         }
     }
 
-    /// One frame off the in-memory line, the rest left for the next.
-    fn read_line(&self, line: &Wire) -> Result<Arrived> {
-        let mut wire = line.locked();
-        let mut reader: &[u8] = &wire;
-        let arrived = self.read_one(&mut reader)?;
-        let consumed = wire.len() - reader.len();
-        wire.drain(..consumed);
-        Ok(arrived)
+    /// The port, opened at the line's first use and kept open for the rest.
+    fn opened<'a>(&self, open: &'a mut Option<Open>) -> Result<&'a mut Open> {
+        let port = match open.take() {
+            Some(port) => port,
+            None => BufReader::new(self.opens.open(&self.port, self.baud)?),
+        };
+        Ok(open.insert(port))
     }
 
-    /// `bytes` framed onto the in-memory line.
-    fn write_line(&self, line: &Wire, bytes: &[u8]) -> Result<()> {
+    /// One frame off the line, each read of the port waiting at most
+    /// `wait`; `None` when nothing arrived within it. A frame begun and cut
+    /// off by the wait is an error: something arrived, and it was no frame.
+    /// A failure of the port itself closes it, for the next use to open it
+    /// again.
+    fn read(&self, wait: Duration) -> Result<Option<Arrived>> {
+        let mut open = self.open.locked();
+        let port = self.opened(&mut open)?;
+        let begun = port
+            .get_mut()
+            .wait(wait)
+            .and_then(|()| port.fill_buf().map(|read| !read.is_empty()));
+        match begun {
+            Ok(true) => self.read_one(port).map(Some),
+            Ok(false) => Ok(None),
+            Err(e) if e.kind() == ErrorKind::TimedOut => Ok(None),
+            Err(e) => {
+                *open = None;
+                Err(classify("reading the port", &e))
+            }
+        }
+    }
+
+    /// `bytes` framed onto the line, the write waiting at most the port's
+    /// own timeout. A failure closes the port, for the next use to open it
+    /// again.
+    fn write(&self, bytes: &[u8]) -> Result<()> {
         let framed = self.framed_bytes(bytes)?;
-        line.locked().extend_from_slice(&framed);
-        Ok(())
+        let mut open = self.open.locked();
+        let port = self.opened(&mut open)?.get_mut();
+        put(port.as_mut(), self.timeout, &framed).map_err(|e| {
+            *open = None;
+            classify("writing to the port", &e)
+        })
     }
+}
 
-    cfg_select! {
-        feature = "port" => {
-            fn open(&self) -> Result<Box<dyn serialport::SerialPort>> {
-                serialport::new(&self.port, self.baud)
-                    .timeout(self.timeout)
-                    .open()
-                    .map_err(|e| {
-                        transport::error::TransportError::retryable(format!(
-                            "opening {}: {e}",
-                            self.port
-                        ))
-                    })
-            }
-
-            fn receive_port(&self) -> Result<Arrived> {
-                let port = self.open()?;
-                let mut reader = std::io::BufReader::new(port);
-                self.read_one(&mut reader)
-            }
-
-            fn send_port(&self, bytes: &[u8]) -> Result<()> {
-                use std::io::Write;
-                let mut port = self.open()?;
-                port.write_all(&self.framed_bytes(bytes)?)
-                    .map_err(|e| classify("writing to the port", &e))?;
-                port.flush().map_err(|e| classify("flushing the port", &e))
-            }
-        }
-        _ => {
-            fn receive_port(&self) -> Result<Arrived> {
-                Err(self.no_port())
-            }
-
-            /// The device cannot be opened on a build without the `port`
-            /// feature.
-            fn no_port(&self) -> transport::error::TransportError {
-                protocol_error(format!(
-                    "built without the port feature: no serial stack on this box for {}",
-                    self.port
-                ))
-            }
-
-            fn send_port(&self, _bytes: &[u8]) -> Result<()> {
-                Err(self.no_port())
-            }
-        }
-    }
+/// `framed` written to `port` and flushed, each waiting at most `wait`.
+fn put(port: &mut dyn Port, wait: Duration, framed: &[u8]) -> std::io::Result<()> {
+    port.wait(wait)?;
+    port.write_all(framed)?;
+    port.flush()
 }
 
 impl Transport for SerialTransport {
@@ -216,14 +224,11 @@ impl Transport for SerialTransport {
         transport::Waiting::Waits("a read of the line waits for a frame or its timeout")
     }
 
-    /// One frame off the port or the loopback line. Acceptance is
-    /// at-most-once here: a raw line has no reply to defer ([`AT_MOST_ONCE`]).
+    /// One frame off the port or the loopback line, or none where nothing
+    /// arrived within the port's timeout. Acceptance is at-most-once here:
+    /// a raw line has no reply to defer ([`AT_MOST_ONCE`]).
     fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
-        let arrived = match &self.line {
-            Some(line) => self.read_line(line)?,
-            None => self.receive_port()?,
-        };
-        Ok(vec![arrived])
+        Ok(self.read(self.timeout)?.into_iter().collect())
     }
 
     fn sending(&self) -> transport::Sending {
@@ -233,24 +238,20 @@ impl Transport for SerialTransport {
     }
 
     fn send_from(&self, _target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
-        let bytes: &[u8] = &outgoing.gather()?;
-        match &self.line {
-            Some(line) => self.write_line(line, bytes),
-            None => self.send_port(bytes),
-        }
+        self.write(&outgoing.gather()?)
     }
 }
 
 impl SerialTransport {
-    /// Both ends on one in-memory line: frames close with end-of-transmission,
-    /// the loopback timeout stands where the device's would.
+    /// Both ends on one in-memory line, read and written as a port is:
+    /// frames close with end-of-transmission, the loopback timeout stands
+    /// where the device's would.
     #[must_use]
     pub fn loopback() -> Self {
-        let mut line = Self::new("loopback", 9600)
+        Self::new("loopback", 9600)
             .framed(Framing::Delimited(vec![0x04]))
-            .timing_out_after(LOOPBACK_TIMEOUT);
-        line.line = Some(Wire::default());
-        line
+            .opened_by(Arc::new(Wire::default()))
+            .timing_out_after(LOOPBACK_TIMEOUT)
     }
 
     /// The framing that carries `payload`: this line's, unless the payload
@@ -271,38 +272,26 @@ impl SerialTransport {
 
 /// A serial port is a line: a frame goes out as the protocol wrote it, and
 /// comes back framed as this port frames — [`Framing::Measured`] for a
-/// protocol that says its own length.
+/// protocol that says its own length. Transmit and receive go through the
+/// one port, kept open between them, so an answer that comes before the
+/// receive is read by it. A read waits what the protocol hands it, a write
+/// the port's own timeout.
 impl Line for SerialTransport {
     fn name(&self) -> String {
         self.port.clone()
     }
 
     fn transmit(&self, frame: &[u8]) -> Result<()> {
-        self.send("", frame)
+        self.write(frame)
     }
 
-    fn receive(&self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
-        match Transport::receive(self) {
-            Ok(arrived) => match arrived.into_iter().next() {
-                Some(one) => Ok(Some(one.taken()?.bytes)),
-                None => Ok(None),
-            },
-            // An in-memory line with nothing on it is silence, not a fault.
-            Err(_)
-                if self
-                    .line
-                    .as_ref()
-                    .is_some_and(|line| lock_line(line).is_empty()) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+    /// `None` where nothing arrived within `timeout`; a frame cut off by it
+    /// is an error.
+    fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        self.read(timeout)?
+            .map(|arrived| arrived.taken().map(|taken| taken.bytes))
+            .transpose()
     }
-}
-
-fn lock_line(line: &Wire) -> std::sync::MutexGuard<'_, Vec<u8>> {
-    line.locked()
 }
 
 impl Loopback for SerialTransport {
@@ -313,7 +302,7 @@ impl Loopback for SerialTransport {
     /// The line one frame was written to. Nothing waits: the round is in
     /// order.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        if self.line.is_none() {
+        if !self.opens.in_process() {
             return Err(protocol_error("a device, not a loopback line"));
         }
         let line = self.clone();
@@ -349,6 +338,10 @@ impl Loopback for SerialTransport {
 mod tests {
     use super::*;
     use std::assert_matches;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::sync::Weak;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use transport::payload::edge_payloads;
 
     /// The bytes of the one frame `read` read, taken.
@@ -412,7 +405,8 @@ mod tests {
             let read = Transport::receive(&loopback).expect("reading");
             assert_eq!(frame(next_arrival(read, "a frame")), sent);
         }
-        assert!(Transport::receive(&loopback).is_err(), "the line is empty");
+        let quiet = Transport::receive(&loopback).expect("nothing there is no error");
+        assert!(quiet.is_empty(), "the line is empty");
     }
 
     #[test]
@@ -443,6 +437,166 @@ mod tests {
             Some(b"frame".to_vec())
         );
         assert_eq!(Line::receive(&wire, Duration::ZERO).expect("silence"), None);
+    }
+
+    /// A device on a bench, handed in as what opens the line's port: what
+    /// it sends lands in each port open at the time and is lost where none
+    /// is, as on a real line. It keeps what was written to it and every
+    /// wait set on a port it opened, and a port it breaks fails its next
+    /// read.
+    #[derive(Clone, Default)]
+    struct Bench {
+        ports: Arc<Mutex<Vec<Weak<Sent>>>>,
+        written: Arc<Mutex<Vec<u8>>>,
+        waits: Arc<Mutex<Vec<Duration>>>,
+        broken: Arc<AtomicBool>,
+    }
+
+    impl Bench {
+        /// The device sends `bytes`, into every port open now.
+        fn sends(&self, bytes: &[u8]) {
+            for port in self.ports.locked().iter().filter_map(Weak::upgrade) {
+                port.locked().extend(bytes);
+            }
+        }
+
+        /// How many times a port was opened on the bench.
+        fn opened(&self) -> usize {
+            self.ports.locked().len()
+        }
+
+        /// A line on the bench, its frames `length` bytes long.
+        fn line(&self, length: usize) -> SerialTransport {
+            SerialTransport::new("COM9", 2400)
+                .framed(Framing::Fixed(length))
+                .opened_by(Arc::new(self.clone()))
+        }
+    }
+
+    impl Opens for Bench {
+        fn open(&self, _port: &str, _baud: u32) -> Result<Box<dyn Port>> {
+            let sent = Arc::default();
+            self.ports.locked().push(Arc::downgrade(&sent));
+            Ok(Box::new(Benched {
+                sent,
+                bench: self.clone(),
+            }))
+        }
+    }
+
+    /// What the device sent a port, not yet read off it.
+    type Sent = Mutex<VecDeque<u8>>;
+
+    /// A port the bench opened.
+    struct Benched {
+        sent: Arc<Sent>,
+        bench: Bench,
+    }
+
+    /// What the device sent, in order; a read with nothing there times
+    /// out, as `serialport`'s does.
+    impl Read for Benched {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.bench.broken.swap(false, Ordering::Relaxed) {
+                return Err(ErrorKind::BrokenPipe.into());
+            }
+            match self.sent.locked().read(buf)? {
+                0 => Err(ErrorKind::TimedOut.into()),
+                read => Ok(read),
+            }
+        }
+    }
+
+    impl Write for Benched {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bench.written.locked().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Port for Benched {
+        fn wait(&mut self, wait: Duration) -> std::io::Result<()> {
+            self.bench.waits.locked().push(wait);
+            Ok(())
+        }
+    }
+
+    /// What the device sends between a write and the read after it waits
+    /// in the port, kept open across both; a port opened for each had no
+    /// handle open when it came, and lost it.
+    #[test]
+    fn an_answer_sent_before_the_read_is_read_off_the_port_kept_open() {
+        let bench = Bench::default();
+        let line = bench.line(3);
+        Line::transmit(&line, b"ask").expect("sent");
+        bench.sends(b"yes");
+        let answer = Line::receive(&line, Duration::from_millis(250)).expect("read");
+        assert_eq!(answer, Some(b"yes".to_vec()));
+        assert_eq!(*bench.written.locked(), b"ask");
+        assert_eq!(bench.opened(), 1, "opened once, kept open");
+    }
+
+    /// A read the wait runs out on with nothing is nothing arrived, to a
+    /// line and to a Receive Location alike, and leaves the port open; a
+    /// frame begun and cut off by the wait is an error.
+    #[test]
+    fn a_read_that_times_out_with_nothing_is_nothing_arrived() {
+        let bench = Bench::default();
+        let line = bench.line(3);
+        let quiet = Line::receive(&line, Duration::from_millis(250)).expect("quiet");
+        assert_eq!(quiet, None);
+        assert!(Transport::receive(&line).expect("quiet").is_empty());
+        bench.sends(b"ye");
+        let cut = Line::receive(&line, Duration::from_millis(250));
+        assert!(cut.is_err(), "a frame cut off is no silence");
+        assert_eq!(bench.opened(), 1, "a timeout leaves the port open");
+    }
+
+    /// Each read sets the wait it is handed on the open port, a write the
+    /// port's own timeout, and a Receive Location's read that too.
+    #[test]
+    fn the_wait_handed_to_each_read_is_set_on_the_open_port() {
+        let bench = Bench::default();
+        let line = bench.line(3);
+        Line::receive(&line, Duration::from_millis(250)).expect("quiet");
+        Line::transmit(&line, b"ask").expect("sent");
+        Line::receive(&line, Duration::from_millis(40)).expect("quiet");
+        Transport::receive(&line).expect("quiet");
+        let waits = [
+            Duration::from_millis(250),
+            TIMEOUT,
+            Duration::from_millis(40),
+            TIMEOUT,
+        ];
+        assert_eq!(*bench.waits.locked(), waits);
+    }
+
+    /// A port that fails is closed, and the next use opens it again.
+    #[test]
+    fn a_port_that_fails_is_opened_again_at_the_next_use() {
+        let bench = Bench::default();
+        let line = bench.line(3);
+        Line::transmit(&line, b"ask").expect("sent");
+        bench.broken.store(true, Ordering::Relaxed);
+        assert!(Line::receive(&line, Duration::from_millis(250)).is_err());
+        Line::transmit(&line, b"ask").expect("sent again");
+        assert_eq!(bench.opened(), 2);
+    }
+
+    /// A port no box has fails to open, worth asking again, and is asked
+    /// again at the next use rather than kept failed.
+    #[cfg(feature = "port")]
+    #[test]
+    fn a_port_no_box_has_fails_to_open_and_is_asked_again() {
+        let port = SerialTransport::new("xmip-no-such-port", 2400);
+        let error = Line::receive(&port, Duration::from_millis(250)).expect_err("no port");
+        assert!(error.retryable, "{error}");
+        assert!(error.message.contains("xmip-no-such-port"), "{error}");
+        assert!(Transport::receive(&port).is_err(), "refused again");
     }
 
     #[test]

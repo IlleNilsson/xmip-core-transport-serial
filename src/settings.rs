@@ -3,7 +3,7 @@
 
 use transport::Configured;
 use transport::error::{Result, protocol_error};
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 use crate::{Framing, MAX_FRAME, SerialTransport, TIMEOUT};
 
@@ -44,23 +44,25 @@ impl Configured for SerialTransport {
                 meaning: "The fixed length of every frame, in place of a delimiter.",
                 applies: Applies::Both,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Default(Fixed::Duration(TIMEOUT)),
-                meaning: "How long a read or a write waits on the port.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                Some(TIMEOUT),
+                "How long a read or a write waits on the port.",
+            ),
         ],
     };
 
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["serial"];
 
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let baud = u32::try_from(settings.integer("baud"))
             .map_err(|_| protocol_error("the baud rate is out of range"))?;
-        let transport = Self::new(address, baud).timing_out_after(settings.duration("timeout"));
+        let transport = Self::new(address, baud);
         match (
             settings.optional_text("delimiter"),
             settings.optional_integer("length"),
