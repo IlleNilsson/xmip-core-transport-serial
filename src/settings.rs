@@ -1,10 +1,14 @@
 //! The settings a serial Location takes, declared once and read through
-//! (ADR-0064, amendment 2026-09-26).
+//! (ADR-0064, amendment 2026-09-26), and the device's port it takes from
+//! what the Locations of its node share (amendment 2026-11-15).
 
-use transport::Configured;
+use std::sync::Arc;
+
 use transport::error::{Result, protocol_error};
+use transport::{Configured, Sharing};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
+use crate::shared_port::SharedPort;
 use crate::{Framing, MAX_FRAME, SerialTransport, TIMEOUT};
 
 impl Configured for SerialTransport {
@@ -57,6 +61,15 @@ impl Configured for SerialTransport {
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.timeout)
+    }
+
+    /// The port every Location naming this line's device on the node goes
+    /// through, by the path it names: the one the first of them opened,
+    /// through what that one opens with.
+    fn shared_by(mut self, sharing: &Arc<dyn Sharing>) -> Self {
+        let opens = Arc::clone(self.shared.opens());
+        self.shared = sharing.one(&self.port, || SharedPort::new(Arc::clone(&opens)));
+        self
     }
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {

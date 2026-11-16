@@ -21,17 +21,36 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 
-# The port itself, cross-platform. Behind the `port` feature, on by default,
-# so a build for a box with no serial stack can leave it out and keep the framing.
-# Without its default features: they are libudev, for listing USB ports, which
-# nothing here does, and on Linux they made the crate need the libudev
-# development headers to build at all — found on the AlmaLinux guest on
-# 2026-09-24, where serial had never been built before.
+# The port itself, behind the `port` feature, on by default, so a build for a
+# box with no serial stack can leave it out and keep the framing.
+#
+# On Windows, the system's own calls (`src/system.rs`): the port opened for
+# overlapped I/O, so a receive waits for its first byte (`WaitCommEvent`)
+# while another Location writes, which `serialport`'s port, opened for
+# synchronous I/O, cannot: Windows runs one call at a time on such a handle,
+# so a wait on it held every write (ADR-0064, amendment 2026-11-15). Each
+# operation on it is waited for by the estate's one overlapped wait, net's
+# (`net::system::overlapped`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Devices_Communication", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main", optional = true }
+
+# On Unix, `serialport`'s port, waited on with `poll` beside the reads and
+# writes (`transport::socket::ready`, over the descriptor `src/system.rs`
+# lends). Without its default features: they are libudev, for listing USB
+# ports, which nothing here does, and on Linux they made the crate need the
+# libudev development headers to build at all — found on the AlmaLinux guest
+# on 2026-09-24, where serial had never been built before.
+[target.'cfg(unix)'.dependencies]
 serialport = { version = "4", optional = true, default-features = false }
 
 [features]
 default = ["port"]
-port = ["dep:serialport"]
+port = ["dep:serialport", "dep:windows-sys", "dep:net"]
+# A device on a bench (`bench`): what a test of a line's port opens it
+# through, with no device and no sleep. A crate asks for it from its
+# dev-dependencies, so it reaches tests and never a production build.
+test-support = []
 
 [dev-dependencies]
 # The loopback payloads the tests drive, from the capability's test
@@ -39,7 +58,12 @@ port = ["dep:serialport"]
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", features = ["test-support"] }
 
 [lints.rust]
-unsafe_code = "forbid"
+# deny, not forbid: the port's calls to the system — Windows', and the
+# descriptor lent to `poll` on Unix — cross a C interface in one file,
+# `src/system.rs`, which lowers this at its top (ADR-0050, amendment
+# 2026-09-25; `test/Unsafe.Test.ps1` lists it). Every other file of the crate
+# writes no unsafe code.
+unsafe_code = "deny"
 
 [lints.clippy]
 too_many_lines = "warn"

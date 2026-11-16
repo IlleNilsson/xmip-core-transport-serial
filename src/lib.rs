@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Streams that arrive on a serial port. One frame is one Stream.
 //!
 //! A serial line has no message boundary of its own, so the boundary is
@@ -13,11 +11,21 @@
 //!
 //! **The port is opened once and kept open** for as long as the line is
 //! used, by every clone of it: a device's answer to a write lands in the
-//! port's buffer while it is open, and is lost where no handle is. Each read
-//! sets its own wait on the open port, each write the port's own timeout; a
-//! read the wait runs out on with nothing is nothing arrived, never an error.
+//! port's buffer while it is open, and is lost where no handle is. Each
+//! receive waits its own wait — on the port's watch for its first byte, on
+//! the port for the rest of its frame — and each write the port's own
+//! timeout; a receive the wait runs out on with nothing is nothing arrived,
+//! never an error.
 //! What the port is opened through is handed in ([`Opens`], ADR-0068): the
 //! operating system's ([`SystemPorts`]) unless another is.
+//!
+//! **On a node a device has one port**, which every Location naming it
+//! shares (`shared_port.rs`; ADR-0064, amendment 2026-11-15): the node hands
+//! in what its Locations share (`transport::Sharing`), and each exchange
+//! holds the port from its transmit through its receive ([`Exchange`]), so
+//! an answer reaches only the Location that asked. A receive holds it only
+//! while a frame arrives: it waits for the first byte on the port's
+//! [`Watch`], holding nothing, so a write goes meanwhile.
 //!
 //! The origin URI is the port: `serial:///dev/ttyUSB0?baud=9600`.
 //!
@@ -29,27 +37,33 @@
 //! **Acceptance is at-most-once here** ([`AT_MOST_ONCE`]): a frame read off
 //! the line is gone, and a raw line has no reply to defer.
 
-use std::io::{BufRead, BufReader, ErrorKind};
-use std::sync::{Arc, Mutex};
+use std::io::BufRead;
+use std::sync::Arc;
 use std::time::Duration;
-use xcore::lock::Locked;
 
 use transport::ArrivalIdentity;
 use transport::arrived::next_arrival;
-use transport::error::{Result, classify, protocol_error};
+use transport::error::{Result, protocol_error};
 use transport::held::Held;
 use transport::line::Line;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport};
+use transport::{Acknowledgement, Arrived, Configured, Directions, Sharing, Taken, Transport};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod bench;
 mod framing;
 mod port;
 mod settings;
+mod shared_port;
+#[cfg(all(feature = "port", any(windows, unix)))]
+mod system;
 
 pub use framing::{Framing, MAX_FRAME, Measure, read_frame};
-pub use port::{Opens, Port, SystemPorts};
+pub use port::{Opens, Port, SystemPorts, Watch};
+pub use shared_port::Exchange;
 
 use crate::port::Wire;
+use crate::shared_port::SharedPort;
 
 /// Why a frame read off a serial line is not acknowledged after the cycle.
 pub const AT_MOST_ONCE: &str = "a serial line has no reply: a frame read off it is gone from \
@@ -60,21 +74,17 @@ pub const AT_MOST_ONCE: &str = "a serial line has no reply: a frame read off it 
 /// own wait.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// An open port, and what was read off it ahead of the frame being read.
-type Open = BufReader<Box<dyn Port>>;
-
 #[derive(Clone)]
 pub struct SerialTransport {
     port: String,
     baud: u32,
     framing: Framing,
     timeout: Duration,
-    /// What the port is opened through: the operating system's, unless
-    /// another is handed in.
-    opens: Arc<dyn Opens>,
-    /// The port once opened, shared by every clone and kept open for as
-    /// long as the line is used.
-    open: Arc<Mutex<Option<Open>>>,
+    /// The device's one port, opened through the operating system's unless
+    /// another is handed in: this line's own and its clones', or on a node
+    /// the one every Location naming the device shares
+    /// ([`Configured::shared_by`]).
+    shared: Arc<SharedPort>,
 }
 
 impl SerialTransport {
@@ -87,18 +97,34 @@ impl SerialTransport {
             baud,
             framing: Framing::Delimited(b"\r\n".to_vec()),
             timeout: TIMEOUT,
-            opens: Arc::new(SystemPorts),
-            open: Arc::default(),
+            shared: Arc::new(SharedPort::new(Arc::new(SystemPorts))),
         }
     }
 
     /// The same line on the port `opens` opens — a provider's, or a test's
-    /// fake (ADR-0068) — in place of the operating system's.
+    /// fake (ADR-0068) — in place of the operating system's, a port of its
+    /// own.
     #[must_use]
     pub fn opened_by(mut self, opens: Arc<dyn Opens>) -> Self {
-        self.opens = opens;
-        self.open = Arc::default();
+        self.shared = Arc::new(SharedPort::new(opens));
         self
+    }
+
+    /// The line's device's port, held for one exchange: every other Location
+    /// naming the device waits until it is dropped. A protocol whose one
+    /// exchange is several frames each way — an IO-Link ISDU — writes and
+    /// reads them all through it, and through nothing else of the device's
+    /// while it holds it: the port is held already.
+    #[must_use]
+    pub fn exchanging(&self) -> Exchange<'_> {
+        Exchange::held(self)
+    }
+
+    /// How long a write waits on the port, and a read unless it is handed
+    /// its own wait.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     #[must_use]
@@ -125,86 +151,32 @@ impl SerialTransport {
     /// # Errors
     /// As [`read_frame`].
     pub fn read_one(&self, reader: &mut impl BufRead) -> Result<Arrived> {
-        let frame = read_frame(reader, &self.framing)?;
-        Ok(Arrived::whole(
+        Ok(self.arrived(read_frame(reader, &self.framing)?))
+    }
+
+    /// `frame`, read off this line, as one Stream arrived whole and
+    /// at-most-once ([`AT_MOST_ONCE`]).
+    fn arrived(&self, frame: Vec<u8>) -> Arrived {
+        Arrived::whole(
             self.origin(),
             frame,
             Acknowledgement::at_most_once(AT_MOST_ONCE),
-        ))
+        )
     }
 
-    /// `bytes` as one frame on the line: the delimiter appended, or the fixed
-    /// length enforced.
-    ///
-    /// # Errors
-    /// A fixed-length frame of the wrong length.
-    fn framed_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        match &self.framing {
-            Framing::Delimited(delimiter) => {
-                let mut out = bytes.to_vec();
-                out.extend_from_slice(delimiter);
-                Ok(out)
-            }
-            Framing::Fixed(length) if bytes.len() == *length => Ok(bytes.to_vec()),
-            Framing::Measured(_) => Ok(bytes.to_vec()),
-            Framing::Fixed(length) => Err(protocol_error(format!(
-                "a frame of {} bytes on a line framed at {length}",
-                bytes.len()
-            ))),
-        }
-    }
-
-    /// The port, opened at the line's first use and kept open for the rest.
-    fn opened<'a>(&self, open: &'a mut Option<Open>) -> Result<&'a mut Open> {
-        let port = match open.take() {
-            Some(port) => port,
-            None => BufReader::new(self.opens.open(&self.port, self.baud)?),
-        };
-        Ok(open.insert(port))
-    }
-
-    /// One frame off the line, each read of the port waiting at most
-    /// `wait`; `None` when nothing arrived within it. A frame begun and cut
-    /// off by the wait is an error: something arrived, and it was no frame.
-    /// A failure of the port itself closes it, for the next use to open it
-    /// again.
+    /// One frame off the line, framed as this line frames, the port held
+    /// only while the frame arrives (`shared_port::arriving`); `None` when
+    /// nothing arrived within `wait`.
     fn read(&self, wait: Duration) -> Result<Option<Arrived>> {
-        let mut open = self.open.locked();
-        let port = self.opened(&mut open)?;
-        let begun = port
-            .get_mut()
-            .wait(wait)
-            .and_then(|()| port.fill_buf().map(|read| !read.is_empty()));
-        match begun {
-            Ok(true) => self.read_one(port).map(Some),
-            Ok(false) => Ok(None),
-            Err(e) if e.kind() == ErrorKind::TimedOut => Ok(None),
-            Err(e) => {
-                *open = None;
-                Err(classify("reading the port", &e))
-            }
-        }
+        let frame = shared_port::arriving(self, &self.framing, wait)?;
+        Ok(frame.map(|frame| self.arrived(frame)))
     }
 
-    /// `bytes` framed onto the line, the write waiting at most the port's
-    /// own timeout. A failure closes the port, for the next use to open it
-    /// again.
+    /// `bytes` framed onto the line as this line frames, the port held for
+    /// the write alone ([`Exchange::transmit`]).
     fn write(&self, bytes: &[u8]) -> Result<()> {
-        let framed = self.framed_bytes(bytes)?;
-        let mut open = self.open.locked();
-        let port = self.opened(&mut open)?.get_mut();
-        put(port.as_mut(), self.timeout, &framed).map_err(|e| {
-            *open = None;
-            classify("writing to the port", &e)
-        })
+        self.exchanging().transmit(&self.framing, bytes)
     }
-}
-
-/// `framed` written to `port` and flushed, each waiting at most `wait`.
-fn put(port: &mut dyn Port, wait: Duration, framed: &[u8]) -> std::io::Result<()> {
-    port.wait(wait)?;
-    port.write_all(framed)?;
-    port.flush()
 }
 
 impl Transport for SerialTransport {
@@ -286,11 +258,22 @@ impl Line for SerialTransport {
     }
 
     /// `None` where nothing arrived within `timeout`; a frame cut off by it
-    /// is an error.
+    /// is an error. The port is held only while the frame arrives.
     fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        self.read(timeout)?
-            .map(|arrived| arrived.taken().map(|taken| taken.bytes))
-            .transpose()
+        shared_port::arriving(self, &self.framing, timeout)
+    }
+
+    /// The port held from the transmit through the receive, so no other
+    /// Location on the device writes or reads between them.
+    fn exchange(&self, frame: &[u8], timeout: Duration) -> Result<Option<Vec<u8>>> {
+        let mut held = self.exchanging();
+        held.transmit(&self.framing, frame)?;
+        held.receive(&self.framing, timeout)
+    }
+
+    /// This line on the device's one port on the node.
+    fn shared_on(&self, sharing: &Arc<dyn Sharing>) -> Option<Arc<dyn Line>> {
+        Some(Arc::new(Configured::shared_by(self.clone(), sharing)))
     }
 }
 
@@ -302,7 +285,7 @@ impl Loopback for SerialTransport {
     /// The line one frame was written to. Nothing waits: the round is in
     /// order.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        if !self.opens.in_process() {
+        if !self.shared.opens().in_process() {
             return Err(protocol_error("a device, not a loopback line"));
         }
         let line = self.clone();
@@ -337,12 +320,11 @@ impl Loopback for SerialTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::Bench;
     use std::assert_matches;
-    use std::collections::VecDeque;
-    use std::io::{Read, Write};
-    use std::sync::Weak;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     use transport::payload::edge_payloads;
+    use xcore::lock::Locked;
 
     /// The bytes of the one frame `read` read, taken.
     fn frame(read: Result<Arrived>) -> Vec<u8> {
@@ -358,7 +340,7 @@ mod tests {
         assert_eq!(first.taken().expect("taken").bytes, b"first");
         assert_eq!(frame(line.read_one(&mut reader)), b"sec\rond");
         assert!(line.read_one(&mut reader).is_err(), "the line closed");
-        assert_eq!(line.framed_bytes(b"go").expect("framed"), b"go\r\n");
+        assert_eq!(line.framing.frame(b"go").expect("framed"), b"go\r\n");
         assert_eq!(line.origin(), "serial://COM3?baud=9600");
         assert_eq!(line.port(), "COM3");
     }
@@ -369,8 +351,8 @@ mod tests {
         let mut reader = std::io::BufReader::new(&b"abcdefgh"[..]);
         assert_eq!(frame(line.read_one(&mut reader)), b"abcd");
         assert_eq!(frame(line.read_one(&mut reader)), b"efgh");
-        assert!(line.framed_bytes(b"abc").is_err());
-        assert_eq!(line.framed_bytes(b"abcd").expect("framed"), b"abcd");
+        assert!(line.framing.frame(b"abc").is_err());
+        assert_eq!(line.framing.frame(b"abcd").expect("framed"), b"abcd");
     }
 
     #[test]
@@ -439,92 +421,6 @@ mod tests {
         assert_eq!(Line::receive(&wire, Duration::ZERO).expect("silence"), None);
     }
 
-    /// A device on a bench, handed in as what opens the line's port: what
-    /// it sends lands in each port open at the time and is lost where none
-    /// is, as on a real line. It keeps what was written to it and every
-    /// wait set on a port it opened, and a port it breaks fails its next
-    /// read.
-    #[derive(Clone, Default)]
-    struct Bench {
-        ports: Arc<Mutex<Vec<Weak<Sent>>>>,
-        written: Arc<Mutex<Vec<u8>>>,
-        waits: Arc<Mutex<Vec<Duration>>>,
-        broken: Arc<AtomicBool>,
-    }
-
-    impl Bench {
-        /// The device sends `bytes`, into every port open now.
-        fn sends(&self, bytes: &[u8]) {
-            for port in self.ports.locked().iter().filter_map(Weak::upgrade) {
-                port.locked().extend(bytes);
-            }
-        }
-
-        /// How many times a port was opened on the bench.
-        fn opened(&self) -> usize {
-            self.ports.locked().len()
-        }
-
-        /// A line on the bench, its frames `length` bytes long.
-        fn line(&self, length: usize) -> SerialTransport {
-            SerialTransport::new("COM9", 2400)
-                .framed(Framing::Fixed(length))
-                .opened_by(Arc::new(self.clone()))
-        }
-    }
-
-    impl Opens for Bench {
-        fn open(&self, _port: &str, _baud: u32) -> Result<Box<dyn Port>> {
-            let sent = Arc::default();
-            self.ports.locked().push(Arc::downgrade(&sent));
-            Ok(Box::new(Benched {
-                sent,
-                bench: self.clone(),
-            }))
-        }
-    }
-
-    /// What the device sent a port, not yet read off it.
-    type Sent = Mutex<VecDeque<u8>>;
-
-    /// A port the bench opened.
-    struct Benched {
-        sent: Arc<Sent>,
-        bench: Bench,
-    }
-
-    /// What the device sent, in order; a read with nothing there times
-    /// out, as `serialport`'s does.
-    impl Read for Benched {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.bench.broken.swap(false, Ordering::Relaxed) {
-                return Err(ErrorKind::BrokenPipe.into());
-            }
-            match self.sent.locked().read(buf)? {
-                0 => Err(ErrorKind::TimedOut.into()),
-                read => Ok(read),
-            }
-        }
-    }
-
-    impl Write for Benched {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.bench.written.locked().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Port for Benched {
-        fn wait(&mut self, wait: Duration) -> std::io::Result<()> {
-            self.bench.waits.locked().push(wait);
-            Ok(())
-        }
-    }
-
     /// What the device sends between a write and the read after it waits
     /// in the port, kept open across both; a port opened for each had no
     /// handle open when it came, and lost it.
@@ -556,23 +452,35 @@ mod tests {
         assert_eq!(bench.opened(), 1, "a timeout leaves the port open");
     }
 
-    /// Each read sets the wait it is handed on the open port, a write the
-    /// port's own timeout, and a Receive Location's read that too.
+    /// A receive looks at the port without waiting and waits the wait it is
+    /// handed on the port's watch, holding nothing; a frame begun is read
+    /// with that wait set on the port. A write waits the port's own
+    /// timeout, a Receive Location's receive that too, and an exchange's
+    /// receive waits on the port it holds.
     #[test]
-    fn the_wait_handed_to_each_read_is_set_on_the_open_port() {
-        let bench = Bench::default();
+    fn the_wait_handed_to_each_read_is_the_watchs_and_the_frames() {
+        let (bench, look) = (Bench::default(), Duration::ZERO);
         let line = bench.line(3);
-        Line::receive(&line, Duration::from_millis(250)).expect("quiet");
+        let (quiet, briefly) = (Duration::from_millis(250), Duration::from_millis(40));
+        assert_eq!(Line::receive(&line, quiet).expect("quiet"), None);
         Line::transmit(&line, b"ask").expect("sent");
-        Line::receive(&line, Duration::from_millis(40)).expect("quiet");
-        Transport::receive(&line).expect("quiet");
-        let waits = [
-            Duration::from_millis(250),
-            TIMEOUT,
-            Duration::from_millis(40),
-            TIMEOUT,
-        ];
+        bench.sends(b"yes");
+        let read = Line::receive(&line, briefly).expect("read");
+        assert_eq!(read, Some(b"yes".to_vec()));
+        assert!(Transport::receive(&line).expect("quiet").is_empty());
+        let exchanged = Line::exchange(&line, b"bid", briefly).expect("quiet");
+        assert_eq!(exchanged, None, "the bench does not answer");
+        let waits = [look, TIMEOUT, look, briefly, look, TIMEOUT, briefly];
         assert_eq!(*bench.waits.locked(), waits);
+        // What is left of the wait once the port was looked at.
+        let watched = bench.watched.locked().clone();
+        assert_eq!(watched.len(), 2, "{watched:?}");
+        for (left, handed) in watched.into_iter().zip([quiet, TIMEOUT]) {
+            assert!(
+                left <= handed && left > handed / 2,
+                "{left:?} of {handed:?}"
+            );
+        }
     }
 
     /// A port that fails is closed, and the next use opens it again.

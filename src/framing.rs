@@ -20,6 +20,29 @@ pub enum Framing {
     Measured(Measure),
 }
 
+impl Framing {
+    /// `bytes` as one frame on a line framed so: the delimiter appended, or
+    /// the fixed length enforced; a measured frame says its own length.
+    ///
+    /// # Errors
+    /// A fixed-length frame of the wrong length.
+    pub(crate) fn frame(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Self::Delimited(delimiter) => {
+                let mut out = bytes.to_vec();
+                out.extend_from_slice(delimiter);
+                Ok(out)
+            }
+            Self::Fixed(length) if bytes.len() == *length => Ok(bytes.to_vec()),
+            Self::Measured(_) => Ok(bytes.to_vec()),
+            Self::Fixed(length) => Err(protocol_error(format!(
+                "a frame of {} bytes on a line framed at {length}",
+                bytes.len()
+            ))),
+        }
+    }
+}
+
 /// How long a frame is, from the bytes read of it so far; see
 /// [`Framing::Measured`].
 pub type Measure = fn(&[u8]) -> Result<Option<usize>>;
