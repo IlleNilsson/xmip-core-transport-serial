@@ -1,20 +1,19 @@
 //! A serial port's Unix path on a real descriptor (ADR-0064, amendment
-//! 2026-11-15): a pseudo-terminal pair, made by `serialport`
-//! (`TTYPort::pair`), its terminal end opened by path as a device is
-//! (`SystemPorts`) and watched with `poll` on a copy of its descriptor, and
-//! the test at the other end as the device. In order of events, no sleep:
-//! each receive waits on the port's watch before the device sends.
+//! 2026-11-15): a pseudo-terminal pair (`terminal.rs`), its line's end
+//! opened by path as a device is (`SystemPorts`) and watched with `poll` on
+//! a copy of its descriptor, and the test at the device's end as the
+//! device. In order of events, no sleep: each receive waits on the port's
+//! watch before the device sends.
 
-use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serialport::{SerialPort, TTYPort};
 use transport::arrived::next_arrival;
 use transport::line::Line;
 use transport::{Arrived, Configured, Shared, Sharing, Transport};
 use xcore::lock::Locked;
 
+use crate::terminal::Terminal;
 use crate::{Framing, SerialTransport, TIMEOUT};
 
 /// How long the device's end waits for what the line writes, and a test
@@ -24,11 +23,9 @@ const WITHIN: Duration = Duration::from_secs(10);
 
 /// A pseudo-terminal: the device's end, and the path of the line's end,
 /// which a line opens itself, as it opens a device.
-fn terminal() -> (TTYPort, String) {
-    let (mut device, line) = TTYPort::pair().expect("a pseudo-terminal");
-    let path = line.name().expect("the line's end has a path");
-    drop(line);
-    device.set_timeout(WITHIN).expect("the device's wait");
+fn terminal() -> (Terminal, String) {
+    let device = Terminal::pair(WITHIN).expect("a pseudo-terminal");
+    let path = device.path();
     (device, path)
 }
 
@@ -57,10 +54,10 @@ fn watched(line: &SerialTransport) -> bool {
 }
 
 /// What the device's end reads: `length` bytes.
-fn heard(device: &mut TTYPort, length: usize) -> Vec<u8> {
-    let mut heard = vec![0; length];
-    device.read_exact(&mut heard).expect("the device hears it");
-    heard
+fn heard(device: &mut Terminal, length: usize) -> Vec<u8> {
+    device
+        .read_frame(&Framing::Fixed(length))
+        .expect("the device hears it")
 }
 
 /// A send on the port goes while a Receive Location's receive waits idle
@@ -76,7 +73,7 @@ fn a_send_goes_while_a_receive_waits_idle_on_a_terminal() {
         sending.send(&path, b"out").expect("sent");
         assert_eq!(heard(&mut device, 3), b"out");
         assert!(!received.is_finished(), "the receive still waits");
-        device.write_all(b"in!").expect("the device sends");
+        device.write(b"in!").expect("the device sends");
         let arrived = received.join().expect("joined").expect("received");
         let taken = next_arrival(arrived, "a frame").and_then(Arrived::taken);
         assert_eq!(taken.expect("read whole").bytes, b"in!");
@@ -94,7 +91,7 @@ fn an_idle_receive_wakes_when_bytes_come_to_a_terminal() {
     std::thread::scope(|scope| {
         let received = scope.spawn(|| Line::receive(&line, TIMEOUT));
         assert!(watched(&line), "the receive waits on the watch");
-        device.write_all(b"abc").expect("the device sends");
+        device.write(b"abc").expect("the device sends");
         let read = received.join().expect("joined").expect("read");
         assert_eq!(read, Some(b"abc".to_vec()));
     });
@@ -113,7 +110,7 @@ fn a_close_ends_a_receive_waiting_on_a_terminal_and_lets_it_go() {
         assert!(watched(&receiving), "the receive waits on the watch");
         closing.exchanging().close();
         assert!(watched(&receiving), "on the terminal opened again");
-        device.write_all(b"yes").expect("the device sends");
+        device.write(b"yes").expect("the device sends");
         let read = received.join().expect("joined").expect("read");
         assert_eq!(read, Some(b"yes".to_vec()));
     });

@@ -95,3 +95,13 @@ closed while a receive waits on its watch ends that wait first, so nothing
 holds the device open once it is closed. The bench drives all of it with no
 device; on Unix it is driven on a real descriptor too, a pseudo-terminal pair
 (`src/shared_port/pseudo_terminal.rs`, run in the Linux guest).
+
+The pair is `terminal::Terminal`, under `test-support` on Unix: a
+pseudo-terminal whose line's end a line opens by its path, as it opens a
+device's port, and whose device's end is read and written as a device does.
+It is the far end a node in a process of its own writes to (the owner,
+2026-11-25: *just do your best for now*): one frame a serial Send Location
+writes, or every frame a protocol's master writes, answered as the
+protocol's device answers on the SDK's bus in process, until the device
+holds a whole Stream (`Terminal::answering`): the root's service test
+proves serial, M-Bus and HART Send Locations through a node so on Linux.

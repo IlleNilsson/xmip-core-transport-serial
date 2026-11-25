@@ -57,6 +57,8 @@ mod settings;
 mod shared_port;
 #[cfg(all(feature = "port", any(windows, unix)))]
 mod system;
+#[cfg(all(unix, feature = "port", any(test, feature = "test-support")))]
+pub mod terminal;
 
 pub use framing::{Framing, MAX_FRAME, Measure, read_frame};
 pub use port::{Opens, Port, SystemPorts, Watch};
