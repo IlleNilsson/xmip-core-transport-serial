@@ -73,10 +73,8 @@ mod system;
 #[cfg(all(unix, feature = "default", any(test, feature = "test-support")))]
 pub mod terminal;
 
-/// How long a read or a write waits on the port until a Location says
-/// otherwise, at the crate's root for the protocols riding on the line.
 #[cfg(feature = "default")]
-pub use declaration::TIMEOUT;
+use declaration::TIMEOUT;
 #[cfg(feature = "default")]
 pub use framing::{Framing, Measure, read_frame};
 #[cfg(feature = "default")]
