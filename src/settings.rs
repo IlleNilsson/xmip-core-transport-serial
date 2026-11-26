@@ -1,63 +1,20 @@
-//! The settings a serial Location takes, declared once and read through
-//! (ADR-0064, amendment 2026-09-26), and the device's port it takes from
-//! what the Locations of its node share (amendment 2026-11-15).
+//! The settings a serial Location takes, read through its declaration
+//! (`crate::declaration`; ADR-0064, amendments 2026-09-26 and 2026-11-26),
+//! and the device's port it takes from what the Locations of its node
+//! share (amendment 2026-11-15).
 
 use std::sync::Arc;
 
 use transport::error::{Result, protocol_error};
 use transport::{Configured, Sharing};
-use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
+use xcore::settings::{Read, Settings};
 
 use crate::shared_port::SharedPort;
-use crate::{Framing, MAX_FRAME, SerialTransport, TIMEOUT};
+use crate::{Framing, SerialTransport, declaration};
 
 impl Configured for SerialTransport {
-    /// The address is the port: `COM3`, `/dev/ttyUSB0`.
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "MAX_FRAME is one mebibyte, far inside an i64"
-    )]
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "baud",
-                kind: Kind::Integer {
-                    minimum: 1,
-                    maximum: 4_294_967_295,
-                },
-                presence: Presence::Required,
-                meaning: "The line's speed in bits per second, such as 9600.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "delimiter",
-                kind: Kind::Text,
-                presence: Presence::Optional,
-                meaning: "The bytes a frame ends with, not part of it; a carriage return and a \
-                          line feed when neither this nor a length is given.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "length",
-                kind: Kind::Integer {
-                    minimum: 1,
-                    maximum: MAX_FRAME as i64,
-                },
-                presence: Presence::Optional,
-                meaning: "The fixed length of every frame, in place of a delimiter.",
-                applies: Applies::Both,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                Some(TIMEOUT),
-                "How long a read or a write waits on the port.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["serial"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.timeout)
@@ -99,9 +56,10 @@ impl Configured for SerialTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::declaration::TIMEOUT;
     use std::assert_matches;
     use transport::Transport;
-    use xcore::settings::Given;
+    use xcore::settings::{Applies, Given};
 
     #[test]
     fn serial_declares_its_settings_and_reads_through_them() {

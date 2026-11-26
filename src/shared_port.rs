@@ -330,14 +330,14 @@ fn put(port: &mut dyn Port, wait: Duration, framed: &[u8]) -> std::io::Result<()
 }
 
 /// The Unix path on a real descriptor, a pseudo-terminal's.
-#[cfg(all(test, unix, feature = "port"))]
+#[cfg(all(test, unix))]
 mod pseudo_terminal;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TIMEOUT;
     use crate::bench::Bench;
+    use crate::declaration::TIMEOUT;
     use std::sync::atomic::Ordering;
     use transport::arrived::next_arrival;
     use transport::line::Line;

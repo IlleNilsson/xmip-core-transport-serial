@@ -12,14 +12,16 @@ path = "src/lib.rs"
 
 [dependencies]
 # A Technology depends on its parent Capability, never the reverse
-# (repository-model.md).
+# (repository-model.md). Its declaration takes the capability's `timeout`
+# (`transport::configured::timeout`), the same on every operating system.
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 
-# The port itself, behind the `port` feature, on by default, so a build for a
-# box with no serial stack can leave it out and keep the framing.
+# The port itself, the technology's code, so behind the default feature; a
+# system that is neither Windows nor Unix has no port and builds the framing
+# alone.
 #
 # On Windows, the system's own calls (`src/system.rs`): the port opened for
 # overlapped I/O, so a receive waits for its first byte (`WaitCommEvent`)
@@ -42,12 +44,20 @@ net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson
 serialport = { version = "4", optional = true, default-features = false }
 
 [features]
-default = ["port"]
-port = ["dep:serialport", "dep:windows-sys", "dep:net"]
+# The technology: its code, the port included, everything it is built on,
+# and its declaration. Without it the crate is its declaration alone
+# (ADR-0064, amendments 2026-10-22 and 2026-11-26).
+default = ["declaration", "dep:serialport", "dep:windows-sys", "dep:net"]
+# The declaration alone: what a Location of this technology is configured
+# with, `declaration::SETTINGS` and `SCHEMES`, and none of the code — what
+# the surfaces' library is to carry (open problem 48). The same on every
+# operating system, one with no serial port included.
+declaration = []
 # A device on a bench (`bench`): what a test of a line's port opens it
 # through, with no device and no sleep. A crate asks for it from its
-# dev-dependencies, so it reaches tests and never a production build.
-test-support = []
+# dev-dependencies, so it reaches tests and never a production build. The
+# technology's code, so the default with it.
+test-support = ["default"]
 
 [dev-dependencies]
 # The loopback payloads the tests drive, from the capability's test

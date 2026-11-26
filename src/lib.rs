@@ -5,9 +5,9 @@
 //! length, or the length the frame says of itself. Everything
 //! between boundaries is the Stream; the port's bytes are never interpreted
 //! here. The port itself — a COM port, `/dev/ttyUSB0`, an RS-485 adapter — is
-//! opened through the `port` feature; the framing is what the tests hold and
-//! is available on a box with no serial stack at all, over an in-memory line
-//! both ends of a loopback share.
+//! opened through the system's calls on Windows and Unix; the framing is what
+//! the tests hold, over an in-memory line both ends of a loopback share, and
+//! is all a system with neither has.
 //!
 //! **The port is opened once and kept open** for as long as the line is
 //! used, by every clone of it: a device's answer to a write lands in the
@@ -36,46 +36,63 @@
 //!
 //! **Acceptance is at-most-once here** ([`AT_MOST_ONCE`]): a frame read off
 //! the line is gone, and a raw line has no reply to defer.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, on every
+//! operating system, and none of the code above, the port included, which
+//! is behind the default feature: what the surfaces' library carries
+//! (ADR-0064, amendment 2026-11-26).
 
-use std::io::BufRead;
-use std::sync::Arc;
-use std::time::Duration;
+#[cfg(feature = "default")]
+use std::{io::BufRead, sync::Arc, time::Duration};
 
-use transport::ArrivalIdentity;
-use transport::arrived::next_arrival;
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
-use transport::held::Held;
-use transport::line::Line;
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::{Acknowledgement, Arrived, Configured, Directions, Sharing, Taken, Transport};
+#[cfg(feature = "default")]
+use transport::{
+    Acknowledgement, ArrivalIdentity, Arrived, Configured, Directions, Sharing, Taken, Transport,
+    arrived::next_arrival, held::Held, line::Line,
+};
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(feature = "default", any(test, feature = "test-support")))]
 pub mod bench;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 mod framing;
+#[cfg(feature = "default")]
 mod port;
+#[cfg(feature = "default")]
 mod settings;
+#[cfg(feature = "default")]
 mod shared_port;
-#[cfg(all(feature = "port", any(windows, unix)))]
+#[cfg(all(feature = "default", any(windows, unix)))]
 mod system;
-#[cfg(all(unix, feature = "port", any(test, feature = "test-support")))]
+#[cfg(all(unix, feature = "default", any(test, feature = "test-support")))]
 pub mod terminal;
 
-pub use framing::{Framing, MAX_FRAME, Measure, read_frame};
+/// How long a read or a write waits on the port until a Location says
+/// otherwise, at the crate's root for the protocols riding on the line.
+#[cfg(feature = "default")]
+pub use declaration::TIMEOUT;
+#[cfg(feature = "default")]
+pub use framing::{Framing, Measure, read_frame};
+#[cfg(feature = "default")]
 pub use port::{Opens, Port, SystemPorts, Watch};
+#[cfg(feature = "default")]
 pub use shared_port::Exchange;
 
-use crate::port::Wire;
-use crate::shared_port::SharedPort;
+#[cfg(feature = "default")]
+use crate::{port::Wire, shared_port::SharedPort};
 
 /// Why a frame read off a serial line is not acknowledged after the cycle.
+#[cfg(feature = "default")]
 pub const AT_MOST_ONCE: &str = "a serial line has no reply: a frame read off it is gone from \
                                 the device's buffer, and the device does not send it again";
 
-/// How long a read or a write waits on the port until a Location says
-/// otherwise; a protocol reading the port as a [`Line`] hands each read its
-/// own wait.
-pub const TIMEOUT: Duration = Duration::from_secs(5);
-
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct SerialTransport {
     port: String,
@@ -89,6 +106,7 @@ pub struct SerialTransport {
     shared: Arc<SharedPort>,
 }
 
+#[cfg(feature = "default")]
 impl SerialTransport {
     /// `port` at `baud`, frames ending in `\r\n`, on the operating system's
     /// port of that name.
@@ -181,6 +199,7 @@ impl SerialTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for SerialTransport {
     fn name(&self) -> &'static str {
         "serial"
@@ -216,6 +235,7 @@ impl Transport for SerialTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl SerialTransport {
     /// Both ends on one in-memory line, read and written as a port is:
     /// frames close with end-of-transmission, the loopback timeout stands
@@ -250,6 +270,7 @@ impl SerialTransport {
 /// one port, kept open between them, so an answer that comes before the
 /// receive is read by it. A read waits what the protocol hands it, a write
 /// the port's own timeout.
+#[cfg(feature = "default")]
 impl Line for SerialTransport {
     fn name(&self) -> String {
         self.port.clone()
@@ -279,6 +300,7 @@ impl Line for SerialTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for SerialTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed("a serial line has one far end, and names it nowhere")
@@ -499,7 +521,7 @@ mod tests {
 
     /// A port no box has fails to open, worth asking again, and is asked
     /// again at the next use rather than kept failed.
-    #[cfg(feature = "port")]
+    #[cfg(any(windows, unix))]
     #[test]
     fn a_port_no_box_has_fails_to_open_and_is_asked_again() {
         let port = SerialTransport::new("xmip-no-such-port", 2400);

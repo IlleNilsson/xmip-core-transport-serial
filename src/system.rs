@@ -129,7 +129,7 @@ mod com {
                 dcb.EofChar = 26;
                 dcb._bitfield = (dcb._bitfield & !FLAGS_SET) | 1;
             })?;
-            port.timeouts(crate::TIMEOUT)?;
+            port.timeouts(crate::declaration::TIMEOUT)?;
             // SAFETY: the handle is open while `port` lives.
             done(unsafe { SetCommMask(port.raw(), EV_RXCHAR) })?;
             Ok(port)

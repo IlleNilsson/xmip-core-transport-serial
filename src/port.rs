@@ -84,21 +84,21 @@ pub trait Opens: Send + Sync {
 }
 
 /// The operating system's serial ports — a COM port, `/dev/ttyUSB0`, an
-/// RS-485 adapter — opened on a build with the `port` feature through the
-/// system's own calls on Windows and through `serialport` on Unix
-/// (`system.rs`), and refused on a build without it.
+/// RS-485 adapter — opened through the system's own calls on Windows and
+/// through `serialport` on Unix (`system.rs`), and refused on a system with
+/// neither.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemPorts;
 
 /// Worth asking again: a port busy or unplugged now may be free or back on
 /// the next use.
-#[cfg(all(feature = "port", any(windows, unix)))]
+#[cfg(any(windows, unix))]
 fn refused(port: &str, error: &dyn std::fmt::Display) -> transport::error::TransportError {
     transport::error::TransportError::retryable(format!("opening {port}: {error}"))
 }
 
 cfg_select! {
-    all(feature = "port", windows) => {
+    windows => {
         impl Opens for SystemPorts {
             fn open(&self, port: &str, baud: u32) -> Result<Box<dyn Port>> {
                 crate::system::ComPort::open(port, baud)
@@ -107,7 +107,7 @@ cfg_select! {
             }
         }
     }
-    all(feature = "port", unix) => {
+    unix => {
         impl Opens for SystemPorts {
             fn open(&self, port: &str, baud: u32) -> Result<Box<dyn Port>> {
                 serialport::new(port, baud)
@@ -140,7 +140,7 @@ cfg_select! {
         impl Opens for SystemPorts {
             fn open(&self, port: &str, _baud: u32) -> Result<Box<dyn Port>> {
                 Err(transport::error::protocol_error(format!(
-                    "built without the port feature: no serial stack on this box for {port}"
+                    "this operating system has no serial ports Xmip opens: none for {port}"
                 )))
             }
         }

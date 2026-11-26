@@ -6,6 +6,8 @@ use std::io::BufRead;
 
 use transport::error::{Result, classify, protocol_error};
 
+use crate::declaration::MAX_FRAME;
+
 /// Where one frame ends. Not comparable: a measured frame's rule is a
 /// function, and two function pointers are not reliably equal.
 #[derive(Clone, Debug)]
@@ -46,9 +48,6 @@ impl Framing {
 /// How long a frame is, from the bytes read of it so far; see
 /// [`Framing::Measured`].
 pub type Measure = fn(&[u8]) -> Result<Option<usize>>;
-
-/// The most a delimited frame may be before the line is judged broken.
-pub const MAX_FRAME: usize = 1024 * 1024;
 
 /// Read one frame from `reader` under `framing`.
 ///

@@ -13,8 +13,9 @@ use transport::line::Line;
 use transport::{Arrived, Configured, Shared, Sharing, Transport};
 use xcore::lock::Locked;
 
+use crate::declaration::TIMEOUT;
 use crate::terminal::Terminal;
-use crate::{Framing, SerialTransport, TIMEOUT};
+use crate::{Framing, SerialTransport};
 
 /// How long the device's end waits for what the line writes, and a test
 /// for a receive to wait on its watch: never run out, a bound on a test
