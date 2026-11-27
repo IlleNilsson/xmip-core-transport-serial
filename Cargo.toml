@@ -44,14 +44,12 @@ net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson
 serialport = { version = "4", optional = true, default-features = false }
 
 [features]
-# The technology: its code, the port included, everything it is built on,
-# and its declaration. Without it the crate is its declaration alone
-# (ADR-0064, amendments 2026-10-22 and 2026-11-26).
+# The code, the port included, and its declaration: the transport guide's
+# "The declaration",
+# module/core/capability/transport/doc/adding-a-transport.md.
 default = ["declaration", "dep:serialport", "dep:windows-sys", "dep:net"]
-# The declaration alone: what a Location of this technology is configured
-# with, `declaration::SETTINGS` and `SCHEMES`, and none of the code — what
-# the surfaces' library is to carry (open problem 48). The same on every
-# operating system, one with no serial port included.
+# The declaration alone. The same on every operating system, one with no
+# serial port included.
 declaration = []
 # A device on a bench (`bench`): what a test of a line's port opens it
 # through, with no device and no sleep. A crate asks for it from its

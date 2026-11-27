@@ -39,10 +39,8 @@
 //! the line is gone, and a raw line has no reply to defer.
 //!
 //! **Built with its `declaration` feature alone** the crate is
-//! [`declaration`], what a Location of it is configured with, on every
-//! operating system, and none of the code above, the port included, which
-//! is behind the default feature: what the surfaces' library carries
-//! (ADR-0064, amendment 2026-11-26).
+//! [`declaration`]. It is the same on every operating system. The code is
+//! behind the default feature, the port included.
 
 #[cfg(feature = "default")]
 use std::{io::BufRead, sync::Arc, time::Duration};
