@@ -2,6 +2,8 @@
 
 Serial transport: bytes on a serial port, delimited or fixed-length frames, one frame is one Stream. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
+A protocol riding on the line frames it in its own terms (`Framing`): a delimiter, a fixed length, the length the frame says of itself (`Framing::Measured`, M-Bus's and HART's), or SLIP's ends and escapes (`Framing::Slip`, RFC 1055), which the host controller interface of IMST's wireless M-Bus receiver sticks frames each message by, the one SLIP in the estate. `Framing::frame` is public, so a far end answering as a device frames what it writes with it too.
+
 `SerialTransport::port` is the port a line is open on, which IO-Link names in its own origin; until 2026-09-28 IO-Link cut it out of this technology's origin itself.
 
 ## Acknowledgement
@@ -125,4 +127,6 @@ It is the far end a node in a process of its own writes to (the owner,
 writes, or every frame a protocol's master writes, answered as the
 protocol's device answers on the SDK's bus in process, until the device
 holds a whole Stream (`Terminal::answering`): the root's service test
-proves serial, M-Bus and HART Send Locations through a node so on Linux.
+proves serial, M-Bus, HART and IO-Link Send Locations through a node so on
+Linux, and a wireless M-Bus one through a receiver stick its own crate
+stands on the pair, answering in SLIP frames (`Framing::Slip`).

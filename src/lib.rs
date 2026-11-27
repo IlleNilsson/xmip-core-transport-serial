@@ -2,7 +2,8 @@
 //!
 //! A serial line has no message boundary of its own, so the boundary is
 //! configured (`framing.rs`): a delimiter the frame ends with, or a fixed
-//! length, or the length the frame says of itself. Everything
+//! length, or the length the frame says of itself, or SLIP's ends and
+//! escapes (RFC 1055), which a protocol's host interface frames by. Everything
 //! between boundaries is the Stream; the port's bytes are never interpreted
 //! here. The port itself — a COM port, `/dev/ttyUSB0`, an RS-485 adapter — is
 //! opened through the system's calls on Windows and Unix; the framing is what
